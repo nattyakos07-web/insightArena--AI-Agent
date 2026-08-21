@@ -5,11 +5,16 @@ import { AppModule } from '../../src/app.module';
 import { AgentService } from '../../src/agent/agent.service';
 import { LlmService } from '../../src/assistant/llm/llm.service';
 import { SorobanService } from '../../src/stellar/soroban.service';
+import { CoachInsightsService } from '../../src/coach/coach-insights.service';
 import { ApiExceptionFilter } from '../../src/common/filters/api-exception.filter';
 
 export const fixedDate = '2026-07-20T09:00:00.000Z';
 export const marketId = '550e8400-e29b-41d4-a716-446655440000';
 export const userId = '550e8400-e29b-41d4-a716-446655440001';
+export const unknownUserId = '550e8400-0000-0000-0000-000000000000';
+
+// Exposed so E2E tests can inspect call counts for cache-hit assertions.
+export let capturedLlmMock: ReturnType<typeof createLlmServiceMock> | null = null;
 
 export function createAgentServiceMock() {
   return {
@@ -63,6 +68,15 @@ export function createLlmServiceMock() {
     isConfigured: () => true,
     complete: jest.fn(async () =>
       JSON.stringify({
+        insights: [
+          {
+            message:
+              "You're on a 6-prediction winning streak! Your recent form is excellent — keep trusting your analysis.",
+            signalType: 'hot-streak',
+            priority: 3,
+          },
+        ],
+        // Legacy fields kept for assistant e2e compatibility
         scoringSuggestion: 'Award 3 points for an exact score, 1 for the result.',
         roundStructure: 'A single round resolved on match day.',
         engagementTips: ['Hype the Arsenal fixture as the headline match.'],
@@ -74,26 +88,60 @@ export function createLlmServiceMock() {
   };
 }
 
+export function createCoachInsightsServiceMock() {
+  return {
+    getInsights: jest.fn(async (requestedUserId: string, refresh = false) => {
+      if (requestedUserId === unknownUserId) {
+        const { NotFoundException } = require('@nestjs/common');
+        throw new NotFoundException(`User '${requestedUserId}' not found`);
+      }
+      return {
+        userId: requestedUserId,
+        generatedAt: fixedDate,
+        cached: false,
+        insights: [
+          {
+            message:
+              "You're on a 6-prediction winning streak! Your recent form is excellent — keep trusting your analysis.",
+            signalType: 'hot-streak',
+            priority: 3,
+          },
+        ],
+      };
+    }),
+    evictCache: jest.fn(),
+    clearCache: jest.fn(),
+  };
+}
+
 export async function createE2eApp(
   configure?: (
     builder: TestingModuleBuilder,
     mocks: {
       agentService: ReturnType<typeof createAgentServiceMock>;
       llmService: ReturnType<typeof createLlmServiceMock>;
+      coachInsightsService: ReturnType<typeof createCoachInsightsServiceMock>;
     },
   ) => void,
 ): Promise<INestApplication> {
   const agentService = createAgentServiceMock();
   const llmService = createLlmServiceMock();
+  const coachInsightsService = createCoachInsightsServiceMock();
+
+  // Expose for cache-hit assertions in coach e2e tests
+  capturedLlmMock = llmService;
+
   const builder = Test.createTestingModule({ imports: [AppModule] })
     .overrideProvider(AgentService)
     .useValue(agentService)
     .overrideProvider(LlmService)
     .useValue(llmService)
     .overrideProvider(SorobanService)
-    .useValue({ isConfigured: () => true, resolveMarket: jest.fn() });
+    .useValue({ isConfigured: () => true, resolveMarket: jest.fn() })
+    .overrideProvider(CoachInsightsService)
+    .useValue(coachInsightsService);
 
-  configure?.(builder, { agentService, llmService });
+  configure?.(builder, { agentService, llmService, coachInsightsService });
 
   const moduleRef = await builder.compile();
   const app = moduleRef.createNestApplication();
@@ -109,6 +157,7 @@ export async function createE2eApp(
       .setVersion('1.0')
       .addTag('agent')
       .addTag('assistant')
+      .addTag('coach')
       .addBearerAuth({ type: 'http', scheme: 'bearer', bearerFormat: 'JWT' }, 'access-token')
       .build(),
   );
