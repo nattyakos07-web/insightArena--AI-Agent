@@ -1,15 +1,22 @@
 import { INestApplication } from '@nestjs/common';
 import * as request from 'supertest';
-import { createE2eApp, userId, unknownUserId } from './create-e2e-app';
+import { createE2eApp, userId, unknownUserId, capturedLlmMock } from './create-e2e-app';
+import { ADMIN_API_KEY_HEADER } from '../../src/common/guards/admin-api-key.guard';
+
+const TEST_ADMIN_KEY = 'test-admin-secret-key';
 
 describe('GET /api/v1/coach/insights/:userId (e2e)', () => {
   let app: INestApplication;
 
+  // Use a fresh app per test so the in-memory cache is clean each time.
   beforeEach(async () => {
+    // Set the admin key env var for tests that need it.
+    process.env.ADMIN_API_KEY = TEST_ADMIN_KEY;
     app = await createE2eApp();
   });
 
   afterEach(async () => {
+    delete process.env.ADMIN_API_KEY;
     await app.close();
   });
 
@@ -22,16 +29,12 @@ describe('GET /api/v1/coach/insights/:userId (e2e)', () => {
       .get(`/api/v1/coach/insights/${userId}`)
       .expect(200);
 
-    expect(body).toMatchObject({
-      userId,
-      cached: false,
-    });
+    expect(body).toMatchObject({ userId, cached: false });
     expect(body.generatedAt).toBeDefined();
     expect(Array.isArray(body.insights)).toBe(true);
     expect(body.insights.length).toBeGreaterThanOrEqual(1);
     expect(body.insights.length).toBeLessThanOrEqual(3);
 
-    // Each insight must conform to the schema
     for (const insight of body.insights) {
       expect(typeof insight.message).toBe('string');
       expect(insight.message.length).toBeGreaterThan(0);
@@ -44,58 +47,80 @@ describe('GET /api/v1/coach/insights/:userId (e2e)', () => {
   });
 
   // -------------------------------------------------------------------------
-  // Cache hit — second call must make zero LLM completions
+  // Cache hit — second call must return cached: true and make zero extra LLM calls
   // -------------------------------------------------------------------------
 
-  it('serves the second request from cache and makes zero LLM calls', async () => {
-    // First call — populates cache
+  it('serves the second request from cache (cached: true) and makes zero extra LLM calls', async () => {
+    // First call — populates cache, LLM is called once
     await request(app.getHttpServer())
       .get(`/api/v1/coach/insights/${userId}`)
       .expect(200);
 
-    // Retrieve the mock so we can count calls
-    const { llmService } = await import('./create-e2e-app').then((m) => ({
-      llmService: m.capturedLlmMock,
-    }));
+    const llmCallsAfterFirst = (capturedLlmMock?.complete as jest.Mock).mock.calls.length;
 
-    const callsAfterFirst = (llmService?.complete as jest.Mock)?.mock.calls.length ?? 0;
-
-    // Second call — should hit cache
+    // Second call — must hit cache
     const { body } = await request(app.getHttpServer())
       .get(`/api/v1/coach/insights/${userId}`)
       .expect(200);
 
     expect(body.cached).toBe(true);
+    expect(body.userId).toBe(userId);
 
-    const callsAfterSecond = (llmService?.complete as jest.Mock)?.mock.calls.length ?? 0;
-    // No additional LLM calls made on the cache-hit request
-    expect(callsAfterSecond).toBe(callsAfterFirst);
+    // No additional LLM calls on a cache hit
+    const llmCallsAfterSecond = (capturedLlmMock?.complete as jest.Mock).mock.calls.length;
+    expect(llmCallsAfterSecond).toBe(llmCallsAfterFirst);
   });
 
   // -------------------------------------------------------------------------
-  // ?refresh=true bypasses cache
+  // ?refresh=true bypasses cache (admin key required)
   // -------------------------------------------------------------------------
 
-  it('?refresh=true bypasses the cache and returns cached: false', async () => {
+  it('?refresh=true with valid admin key bypasses the cache and returns fresh insights (cached: false)', async () => {
     // Warm the cache
     await request(app.getHttpServer())
       .get(`/api/v1/coach/insights/${userId}`)
       .expect(200);
 
-    // Force refresh
+    // Force refresh with a valid admin key
     const { body } = await request(app.getHttpServer())
       .get(`/api/v1/coach/insights/${userId}?refresh=true`)
+      .set(ADMIN_API_KEY_HEADER, TEST_ADMIN_KEY)
       .expect(200);
 
     expect(body.cached).toBe(false);
     expect(body.userId).toBe(userId);
   });
 
+  it('?refresh=true without admin key returns 403 in the standard error shape', async () => {
+    const { body } = await request(app.getHttpServer())
+      .get(`/api/v1/coach/insights/${userId}?refresh=true`)
+      .expect(403);
+
+    expect(body).toMatchObject({
+      statusCode: 403,
+      error: 'Forbidden',
+    });
+    expect(body).toHaveProperty('timestamp');
+    expect(body).toHaveProperty('path');
+  });
+
+  it('?refresh=true with a wrong admin key returns 403', async () => {
+    const { body } = await request(app.getHttpServer())
+      .get(`/api/v1/coach/insights/${userId}?refresh=true`)
+      .set(ADMIN_API_KEY_HEADER, 'wrong-key')
+      .expect(403);
+
+    expect(body).toMatchObject({
+      statusCode: 403,
+      error: 'Forbidden',
+    });
+  });
+
   // -------------------------------------------------------------------------
   // 404 — unknown user
   // -------------------------------------------------------------------------
 
-  it('returns 404 for an unknown userId', async () => {
+  it('returns 404 with the standard error shape for an unknown userId', async () => {
     const { body } = await request(app.getHttpServer())
       .get(`/api/v1/coach/insights/${unknownUserId}`)
       .expect(404);
@@ -110,7 +135,7 @@ describe('GET /api/v1/coach/insights/:userId (e2e)', () => {
   });
 
   // -------------------------------------------------------------------------
-  // 400 — invalid userId format (not a UUID)
+  // 400 — invalid userId format
   // -------------------------------------------------------------------------
 
   it('returns 400 when userId is not a valid UUID', async () => {
