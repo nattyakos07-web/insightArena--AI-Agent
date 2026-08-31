@@ -4,18 +4,11 @@ import { TrendService } from './trend.service';
 import { UserPerformance, TrendSignal } from './interfaces/trend.interface';
 import { CoachingInsight, LlmInsightResponse } from './interfaces/coaching-insight.interface';
 import { buildCoachingInsightPrompt } from './prompts/coaching-insight.prompt';
-import {
-  MAX_INSIGHT_MESSAGE_LENGTH,
-  containsInsightBlockedPhrase,
-} from './coach.constants';
+import { MAX_INSIGHT_MESSAGE_LENGTH, containsInsightBlockedPhrase } from './coach.constants';
 
 // ---------------------------------------------------------------------------
-// Fallback template messages
+// Deterministic fallback messages (used when LLM fails or all insights reject)
 // ---------------------------------------------------------------------------
-// Used when the LLM call fails, returns invalid JSON, or every generated
-// insight violates a hard rule.  Each fallback references the signal data
-// to stay concrete; they are intentionally deterministic and never use
-// gambling-adjacent language.
 
 function buildFallbackInsights(
   performance: UserPerformance,
@@ -31,7 +24,7 @@ function buildFallbackInsights(
         };
       case 'cold-streak':
         return {
-          message: `You've had a tough run recently (${signal.data.streakLength} in a row). Take time to review the data before your next pick — every expert has rough patches.`,
+          message: `You've had ${signal.data.streakLength} tough picks in a row. Take time to review the data before your next pick — every expert has rough patches.`,
           signalType: 'cold-streak',
           priority: 2,
         };
@@ -69,20 +62,15 @@ function buildFallbackInsights(
 // Validation helpers
 // ---------------------------------------------------------------------------
 
-const VALID_SIGNAL_TYPES = new Set<string>([
+const VALID_SIGNAL_TYPES = new Set([
   'hot-streak',
   'cold-streak',
   'improving',
   'declining',
   'near-milestone',
 ]);
+const VALID_PRIORITIES = new Set([1, 2, 3]);
 
-const VALID_PRIORITIES = new Set<number>([1, 2, 3]);
-
-/**
- * Validates a single raw insight object from the LLM response.
- * Returns true only if it has the correct shape and data types.
- */
 function isValidInsightShape(raw: unknown): raw is CoachingInsight {
   if (!raw || typeof raw !== 'object') return false;
   const obj = raw as Record<string, unknown>;
@@ -95,13 +83,6 @@ function isValidInsightShape(raw: unknown): raw is CoachingInsight {
   );
 }
 
-/**
- * Enforces the hard post-generation rules on a coaching insight:
- *   1. Message length ≤ 280 characters
- *   2. No gambling-encouragement phrases
- *
- * Returns the insight if it passes, or `null` if it fails any rule.
- */
 function enforceInsightRules(insight: CoachingInsight): CoachingInsight | null {
   if (insight.message.length > MAX_INSIGHT_MESSAGE_LENGTH) return null;
   if (containsInsightBlockedPhrase(insight.message)) return null;
@@ -112,21 +93,6 @@ function enforceInsightRules(insight: CoachingInsight): CoachingInsight | null {
 // Service
 // ---------------------------------------------------------------------------
 
-/**
- * CoachService generates personalized coaching insights for a user based on
- * their prediction history and detected trend signals.
- *
- * Pipeline:
- *   1. Fetch UserPerformance by userId (caller provides it for testability)
- *   2. Run TrendService.detectSignals() to get TrendSignal[]
- *   3. Build the coaching-insight prompt
- *   4. Call LlmService.complete() with JSON mode
- *   5. Parse, validate structure, and enforce hard rules (length + blocklist)
- *   6. Fall back to deterministic template messages if LLM fails or all
- *      insights are rejected
- *
- * The user always receives insights — never an error.
- */
 @Injectable()
 export class CoachService {
   private readonly logger = new Logger(CoachService.name);
@@ -136,17 +102,9 @@ export class CoachService {
     private readonly trendService: TrendService,
   ) {}
 
-  /**
-   * Main entry point.  Given a `UserPerformance` snapshot, returns 1–3
-   * validated `CoachingInsight` objects.
-   *
-   * @param performance - The user's prediction history and personal best streak.
-   * @returns Array of 1–3 coaching insights, always populated (never throws).
-   */
   async generateInsights(performance: UserPerformance): Promise<CoachingInsight[]> {
     const signals = this.trendService.detectSignals(performance);
 
-    // No signals detected — return a generic encouragement fallback.
     if (signals.length === 0) {
       return [
         {
@@ -157,13 +115,9 @@ export class CoachService {
       ];
     }
 
-    // Attempt LLM-powered insight generation.
     try {
       const insights = await this.generateWithLlm(performance, signals);
-      if (insights.length > 0) {
-        return insights;
-      }
-      // LLM returned insights but all failed validation — fall through.
+      if (insights.length > 0) return insights;
       this.logger.warn('All LLM insights failed post-generation validation; using fallback.');
     } catch (err) {
       this.logger.warn(
@@ -174,21 +128,11 @@ export class CoachService {
     return buildFallbackInsights(performance, signals);
   }
 
-  // ---------------------------------------------------------------------------
-  // Private helpers
-  // ---------------------------------------------------------------------------
-
-  /**
-   * Calls the LLM and returns validated insights.
-   * Throws if the LLM call fails or the response is not valid JSON.
-   * Returns an empty array if all insights fail post-generation rule enforcement.
-   */
   private async generateWithLlm(
     performance: UserPerformance,
     signals: TrendSignal[],
   ): Promise<CoachingInsight[]> {
     const prompt = buildCoachingInsightPrompt(performance, signals);
-
     const raw = await this.llm.complete({
       system: prompt.system,
       user: prompt.user,
@@ -197,23 +141,16 @@ export class CoachService {
     });
 
     const parsed = this.parseAndValidateLlmResponse(raw);
-    if (parsed === null) {
+    if (!parsed) {
       throw new Error('LLM response did not match the expected CoachingInsight JSON schema');
     }
 
-    // Apply per-insight hard rules; keep only insights that pass.
-    const validated = parsed.insights
-      .slice(0, 3) // cap at 3
+    return parsed.insights
+      .slice(0, 3)
       .map(enforceInsightRules)
       .filter((i): i is CoachingInsight => i !== null);
-
-    return validated;
   }
 
-  /**
-   * Parses the raw LLM string response into a `LlmInsightResponse`.
-   * Returns `null` if parsing fails or the shape is invalid.
-   */
   private parseAndValidateLlmResponse(raw: string): LlmInsightResponse | null {
     let parsed: unknown;
     try {
@@ -222,15 +159,11 @@ export class CoachService {
       this.logger.warn('LLM response was not valid JSON');
       return null;
     }
-
     if (!parsed || typeof parsed !== 'object') return null;
     const obj = parsed as Record<string, unknown>;
-
     if (!Array.isArray(obj['insights'])) return null;
-
     const insights = (obj['insights'] as unknown[]).filter(isValidInsightShape);
     if (insights.length === 0) return null;
-
     return { insights };
   }
 }

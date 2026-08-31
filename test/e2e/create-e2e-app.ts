@@ -10,6 +10,10 @@ import { ApiExceptionFilter } from '../../src/common/filters/api-exception.filte
 export const fixedDate = '2026-07-20T09:00:00.000Z';
 export const marketId = '550e8400-e29b-41d4-a716-446655440000';
 export const userId = '550e8400-e29b-41d4-a716-446655440001';
+export const unknownUserId = '550e8400-0000-0000-0000-000000000000';
+
+// Exposed so E2E tests can inspect LLM call counts for cache-hit assertions.
+export let capturedLlmMock: ReturnType<typeof createLlmServiceMock> | null = null;
 
 export function createAgentServiceMock() {
   return {
@@ -63,6 +67,16 @@ export function createLlmServiceMock() {
     isConfigured: () => true,
     complete: jest.fn(async () =>
       JSON.stringify({
+        // Coaching insights shape (used by CoachService)
+        insights: [
+          {
+            message:
+              "You're on a 6-prediction winning streak! Your recent form is excellent — keep trusting your analysis.",
+            signalType: 'hot-streak',
+            priority: 3,
+          },
+        ],
+        // Legacy fields kept for assistant e2e compatibility
         scoringSuggestion: 'Award 3 points for an exact score, 1 for the result.',
         roundStructure: 'A single round resolved on match day.',
         engagementTips: ['Hype the Arsenal fixture as the headline match.'],
@@ -85,6 +99,13 @@ export async function createE2eApp(
 ): Promise<INestApplication> {
   const agentService = createAgentServiceMock();
   const llmService = createLlmServiceMock();
+
+  // Expose so coach E2E tests can count LLM calls for cache-hit assertions.
+  capturedLlmMock = llmService;
+
+  // NOTE: CoachInsightsService is intentionally NOT mocked so that the real
+  // in-memory cache is exercised (cache-hit test requires cached: true on
+  // second call). Only LlmService is mocked to keep LLM calls controlled.
   const builder = Test.createTestingModule({ imports: [AppModule] })
     .overrideProvider(AgentService)
     .useValue(agentService)
@@ -109,6 +130,7 @@ export async function createE2eApp(
       .setVersion('1.0')
       .addTag('agent')
       .addTag('assistant')
+      .addTag('coach')
       .addBearerAuth({ type: 'http', scheme: 'bearer', bearerFormat: 'JWT' }, 'access-token')
       .build(),
   );
