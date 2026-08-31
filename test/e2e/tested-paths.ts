@@ -6,4 +6,5 @@ export const E2E_TESTED_PATHS = [
   '/api/v1/agent/leaderboard/{userId}',
   '/api/v1/assistant/advise',
   '/api/v1/assistant/naming',
+  '/api/v1/coach/insights/{userId}',
 ] as const;
