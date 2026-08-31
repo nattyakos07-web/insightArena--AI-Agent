@@ -14,6 +14,7 @@ import { LlmModule } from './llm/llm.module';
     AgentModule,
     AssistantModule,
     StellarModule,
+    CoachModule,
   ],
 })
 export class AppModule { }
